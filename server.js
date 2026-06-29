@@ -260,8 +260,8 @@ app.use("/api", router);
 app.use(`${BASE}/api`, router);
 
 // ── Start ────────────────────────────────────────────────────
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n🚀 VoiceLink Pro running on port ${PORT}`);
   console.log(`   Local:   http://localhost:${PORT}${BASE}`);
   console.log(`   Health:  http://localhost:${PORT}${BASE}/api/health\n`);
