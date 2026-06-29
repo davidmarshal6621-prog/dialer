@@ -38,3 +38,11 @@ externalPort = 80
 deploymentTarget = "autoscale"
 run = ["node", "server.js"]
 build = ["npm", "run", "build"]
+
+[userenv]
+
+[userenv.shared]
+TWILIO_NUMBER = "+13108613818"
+SIP_DOMAIN = "Sipname.pstn.twilio.com"
+FRONTEND_URL = "https://n09qvpa.pike.replit.dev"
+BASE_PATH = "/Dialer"
