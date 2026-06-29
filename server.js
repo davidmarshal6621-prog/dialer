@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════════════
 // VoiceLink Pro — Complete Backend Server
 // Node.js + Express + Twilio
+// cPanel compatible — serves React build under /Dialer
 // ═══════════════════════════════════════════════════════════════
 require("dotenv").config();
 const express    = require("express");
@@ -12,123 +13,148 @@ const fs         = require("fs");
 
 const app = express();
 
-// ── Middleware ──────────────────────────────────────────────
+// ── Sub-path config (cPanel URI context = /Dialer) ──────────
+const BASE = process.env.BASE_PATH || "/Dialer";
+
+// ── Middleware ───────────────────────────────────────────────
 app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
 
-// ── Twilio Client ───────────────────────────────────────────
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+// ── Serve React build statically ────────────────────────────
+// Place your React build/ folder inside the same directory as server.js
+const buildPath = path.join(__dirname, "build");
+if (fs.existsSync(buildPath)) {
+  app.use(BASE, express.static(buildPath));
+  app.use(express.static(buildPath));
+  console.log("✅ React build found — serving from", buildPath);
+} else {
+  console.log("⚠️  No build/ folder found. Run: npm run build");
+}
 
-// ── Recordings in-memory store (use DB in production) ───────
+// ── Root "/" → redirect to /Dialer ──────────────────────────
+app.get("/", (req, res) => res.redirect(301, BASE));
+
+// ── GET /Dialer → serve React app ───────────────────────────
+app.get(BASE, (req, res) => {
+  const idx = path.join(buildPath, "index.html");
+  if (fs.existsSync(idx)) {
+    return res.sendFile(idx);
+  }
+  res.send(`
+    <html>
+    <head><title>VoiceLink Pro</title></head>
+    <body style="font-family:sans-serif;background:#0c0c12;color:#e2e8f0;padding:40px;text-align:center;">
+      <h2 style="color:#6366f1">VoiceLink Pro Backend ✅</h2>
+      <p style="color:#888">Server is running. React build not uploaded yet.</p>
+      <p style="color:#555">Upload your <strong>build/</strong> folder next to server.js in cPanel</p>
+      <br>
+      <a href="${BASE}/api/health" style="color:#6366f1;font-size:14px">Check API Health →</a>
+    </body>
+    </html>
+  `);
+});
+
+// ── /Dialer/* → SPA fallback (React Router support) ─────────
+app.get(`${BASE}/*`, (req, res, next) => {
+  if (req.path.includes("/api/")) return next();
+  const idx = path.join(buildPath, "index.html");
+  if (fs.existsSync(idx)) return res.sendFile(idx);
+  res.redirect(BASE);
+});
+
+// ── Twilio Client ────────────────────────────────────────────
+let twilioClient = null;
+try {
+  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+    twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    console.log("✅ Twilio client initialized");
+  } else {
+    console.log("⚠️  Twilio credentials not set in .env");
+  }
+} catch(e) {
+  console.error("Twilio init error:", e.message);
+}
+
+// ── Recordings store ─────────────────────────────────────────
 let recordings = [];
 
 // ════════════════════════════════════════════════════════════
-// 1. GENERATE ACCESS TOKEN (for browser calls via Twilio SDK)
+// API ROUTES — all under /Dialer/api/ AND /api/ (both work)
 // ════════════════════════════════════════════════════════════
-app.get("/api/token", (req, res) => {
-  try {
-    const AccessToken  = twilio.jwt.AccessToken;
-    const VoiceGrant   = AccessToken.VoiceGrant;
+const router = express.Router();
 
+// 1. TOKEN — Twilio access token for browser calls
+router.get("/token", (req, res) => {
+  try {
+    if (!twilioClient) return res.status(503).json({ error: "Twilio not configured. Set credentials in .env" });
+    const AccessToken = twilio.jwt.AccessToken;
+    const VoiceGrant  = AccessToken.VoiceGrant;
     const token = new AccessToken(
       process.env.TWILIO_ACCOUNT_SID,
       process.env.TWILIO_API_KEY,
       process.env.TWILIO_API_SECRET,
       { identity: req.query.identity || "voicelink_user" }
     );
-
-    const voiceGrant = new VoiceGrant({
+    const grant = new VoiceGrant({
       outgoingApplicationSid: process.env.TWILIO_TWIML_APP_SID,
       incomingAllow: true,
     });
-    token.addGrant(voiceGrant);
-
+    token.addGrant(grant);
     res.json({ token: token.toJwt(), identity: token.identity });
   } catch (err) {
-    console.error("Token error:", err);
-    res.status(500).json({ error: "Token generation failed", detail: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ════════════════════════════════════════════════════════════
-// 2. TWIML — Handle outbound call routing
-// ════════════════════════════════════════════════════════════
-app.post("/api/voice", (req, res) => {
+// 2. VOICE — TwiML outbound call handler
+router.post("/voice", (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const to    = req.body.To;
-
-  if (!to) {
-    twiml.say("No destination number provided.");
-    return res.type("text/xml").send(twiml.toString());
-  }
-
+  if (!to) { twiml.say("No destination."); return res.type("text/xml").send(twiml.toString()); }
   const dial = twiml.dial({
-    callerId:    process.env.TWILIO_NUMBER,
-    record:      "record-from-ringing",
-    recordingStatusCallback:     "/api/recording-complete",
+    callerId: process.env.TWILIO_NUMBER,
+    record: "record-from-ringing",
+    recordingStatusCallback:      `https://${req.hostname}${BASE}/api/recording-complete`,
     recordingStatusCallbackMethod: "POST",
   });
-
-  // Phone number or SIP
-  if (to.startsWith("sip:")) {
-    dial.sip(to);
-  } else {
-    dial.number(to);
-  }
-
+  if (to.startsWith("sip:")) dial.sip(to);
+  else dial.number(to);
   res.type("text/xml").send(twiml.toString());
 });
 
-// ════════════════════════════════════════════════════════════
-// 3. TWIML — Incoming call handler (IVR)
-// ════════════════════════════════════════════════════════════
-app.post("/api/incoming", (req, res) => {
-  const twiml   = new twilio.twiml.VoiceResponse();
-  const gather  = twiml.gather({ numDigits: 1, action: "/api/ivr-route", method: "POST" });
-
-  gather.say(
-    { voice: "Polly.Joanna" },
-    "Welcome to VoiceLink Pro. Press 1 for Sales, Press 2 for Support, Press 3 for Billing."
-  );
-  twiml.say("We did not receive your input. Goodbye.");
-
+// 3. INCOMING — IVR
+router.post("/incoming", (req, res) => {
+  const twiml  = new twilio.twiml.VoiceResponse();
+  const gather = twiml.gather({ numDigits: 1, action: `https://${req.hostname}${BASE}/api/ivr-route`, method: "POST" });
+  gather.say({ voice: "Polly.Joanna" }, "Welcome to VoiceLink Pro. Press 1 for Sales, 2 for Support, 3 for Billing.");
+  twiml.redirect(`https://${req.hostname}${BASE}/api/incoming`);
   res.type("text/xml").send(twiml.toString());
 });
 
-// ════════════════════════════════════════════════════════════
-// 4. IVR ROUTING
-// ════════════════════════════════════════════════════════════
-app.post("/api/ivr-route", (req, res) => {
+// 4. IVR ROUTE
+router.post("/ivr-route", (req, res) => {
   const digit  = req.body.Digits;
   const twiml  = new twilio.twiml.VoiceResponse();
-
   const routes = {
     "1": process.env.SALES_NUMBER   || process.env.TWILIO_NUMBER,
     "2": process.env.SUPPORT_NUMBER || process.env.TWILIO_NUMBER,
     "3": process.env.BILLING_NUMBER || process.env.TWILIO_NUMBER,
   };
-
   if (routes[digit]) {
     const dial = twiml.dial({ callerId: process.env.TWILIO_NUMBER });
     dial.number(routes[digit]);
   } else {
-    twiml.say("Invalid option. Goodbye.");
+    twiml.say("Invalid option."); twiml.redirect(`https://${req.hostname}${BASE}/api/incoming`);
   }
-
   res.type("text/xml").send(twiml.toString());
 });
 
-// ════════════════════════════════════════════════════════════
 // 5. SEND SMS
-// ════════════════════════════════════════════════════════════
-app.post("/api/sms/send", async (req, res) => {
+router.post("/sms/send", async (req, res) => {
+  if (!twilioClient) return res.status(503).json({ error: "Twilio not configured" });
   const { to, body } = req.body;
   if (!to || !body) return res.status(400).json({ error: "to and body required" });
-
   try {
     const msg = await twilioClient.messages.create({
       from: process.env.TWILIO_NUMBER,
@@ -137,69 +163,54 @@ app.post("/api/sms/send", async (req, res) => {
     });
     res.json({ success: true, sid: msg.sid, status: msg.status });
   } catch (err) {
-    console.error("SMS error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ════════════════════════════════════════════════════════════
-// 6. SMS INCOMING WEBHOOK
-// ════════════════════════════════════════════════════════════
-app.post("/api/sms/incoming", (req, res) => {
+// 6. INCOMING SMS WEBHOOK
+router.post("/sms/incoming", (req, res) => {
   const { From, Body } = req.body;
-  console.log(`SMS from ${From}: ${Body}`);
-  // Store in DB / push to frontend via WebSocket in production
+  console.log(`📩 SMS from ${From}: ${Body}`);
   const twiml = new twilio.twiml.MessagingResponse();
-  // Auto-reply (optional)
-  // twiml.message("Thanks! We received your message.");
   res.type("text/xml").send(twiml.toString());
 });
 
-// ════════════════════════════════════════════════════════════
 // 7. RECORDING COMPLETE CALLBACK
-// ════════════════════════════════════════════════════════════
-app.post("/api/recording-complete", async (req, res) => {
+router.post("/recording-complete", (req, res) => {
   const { CallSid, RecordingUrl, RecordingSid, RecordingDuration } = req.body;
-  const rec = {
-    id:        RecordingSid,
-    callSid:   CallSid,
-    url:        RecordingUrl + ".mp3",
-    duration:   parseInt(RecordingDuration || 0),
-    createdAt:  new Date().toISOString(),
-  };
-  recordings.unshift(rec);
-  console.log("Recording saved:", rec);
+  recordings.unshift({
+    id: RecordingSid,
+    callSid: CallSid,
+    url: RecordingUrl + ".mp3",
+    duration: parseInt(RecordingDuration || 0),
+    createdAt: new Date().toISOString(),
+  });
+  console.log("🎙 Recording saved:", RecordingSid);
   res.sendStatus(200);
 });
 
-// ════════════════════════════════════════════════════════════
 // 8. GET RECORDINGS LIST
-// ════════════════════════════════════════════════════════════
-app.get("/api/recordings", async (req, res) => {
+router.get("/recordings", async (req, res) => {
   try {
-    // Fetch from Twilio (live)
+    if (!twilioClient) return res.json(recordings);
     const list = await twilioClient.recordings.list({ limit: 50 });
-    const data = list.map(r => ({
-      id:       r.sid,
-      callSid:  r.callSid,
-      url:      `https://api.twilio.com${r.uri.replace(".json",".mp3")}`,
+    res.json(list.map(r => ({
+      id: r.sid,
+      callSid: r.callSid,
+      url: `https://api.twilio.com${r.uri.replace(".json", ".mp3")}`,
       duration: r.duration,
       createdAt: r.dateCreated,
-    }));
-    res.json(data);
+    })));
   } catch (err) {
-    // Fallback to in-memory
     res.json(recordings);
   }
 });
 
-// ════════════════════════════════════════════════════════════
-// 9. DOWNLOAD RECORDING (proxied — keeps Twilio auth hidden)
-// ════════════════════════════════════════════════════════════
-app.get("/api/recordings/:sid/download", async (req, res) => {
+// 9. DOWNLOAD RECORDING (proxied)
+router.get("/recordings/:sid/download", async (req, res) => {
+  if (!twilioClient) return res.status(503).json({ error: "Twilio not configured" });
   try {
-    const sid = req.params.sid;
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${sid}.mp3`;
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${req.params.sid}.mp3`;
     const response = await fetch(url, {
       headers: {
         Authorization: "Basic " + Buffer.from(
@@ -207,47 +218,51 @@ app.get("/api/recordings/:sid/download", async (req, res) => {
         ).toString("base64"),
       },
     });
-    if (!response.ok) return res.status(404).json({ error: "Recording not found" });
+    if (!response.ok) return res.status(404).json({ error: "Not found" });
     res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Content-Disposition", `attachment; filename="recording-${sid}.mp3"`);
+    res.setHeader("Content-Disposition", `attachment; filename="rec-${req.params.sid}.mp3"`);
     response.body.pipe(res);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ════════════════════════════════════════════════════════════
-// 10. SIP VALIDATE (check credentials before frontend shows connected)
-// ════════════════════════════════════════════════════════════
-app.post("/api/sip/validate", async (req, res) => {
+// 10. SIP VALIDATE
+router.post("/sip/validate", async (req, res) => {
   const { domain, username, password, number } = req.body;
   if (!domain || !username || !password || !number) {
     return res.status(400).json({ valid: false, error: "All fields required" });
   }
+  if (!twilioClient) return res.json({ valid: false, error: "Twilio not configured on server" });
   try {
-    // Verify the number actually belongs to this Twilio account
     const numbers = await twilioClient.incomingPhoneNumbers.list({ phoneNumber: number });
-    if (numbers.length === 0) {
-      return res.json({ valid: false, error: "Number not found in your Twilio account" });
-    }
-    res.json({ valid: true, message: "SIP credentials verified" });
+    if (numbers.length === 0) return res.json({ valid: false, error: "Number not in Twilio account" });
+    res.json({ valid: true, message: "SIP verified ✅" });
   } catch (err) {
     res.status(500).json({ valid: false, error: err.message });
   }
 });
 
-// ════════════════════════════════════════════════════════════
 // 11. HEALTH CHECK
-// ════════════════════════════════════════════════════════════
-app.get("/api/health", (req, res) => {
+router.get("/health", (req, res) => {
   res.json({
-    status:    "ok",
-    twilio:    !!process.env.TWILIO_ACCOUNT_SID,
-    number:    process.env.TWILIO_NUMBER || "not set",
-    timestamp: new Date().toISOString(),
+    status:     "ok",
+    base_path:  BASE,
+    twilio:     !!twilioClient,
+    number:     process.env.TWILIO_NUMBER || "not set",
+    build:      fs.existsSync(buildPath) ? "found" : "missing",
+    timestamp:  new Date().toISOString(),
   });
 });
 
-// ── Start ───────────────────────────────────────────────────
+// ── Mount router at BOTH /api and /Dialer/api ────────────────
+app.use("/api", router);
+app.use(`${BASE}/api`, router);
+
+// ── Start ────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`VoiceLink backend running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`\n🚀 VoiceLink Pro running on port ${PORT}`);
+  console.log(`   Local:   http://localhost:${PORT}${BASE}`);
+  console.log(`   Health:  http://localhost:${PORT}${BASE}/api/health\n`);
+});
