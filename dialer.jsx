@@ -1,6 +1,23 @@
 import { useState, useEffect, useRef } from "react";
 
 // ════════════════════════════════════════════════════════════
+// BACKEND API URL — empty string = same origin (same server)
+// ════════════════════════════════════════════════════════════
+const API_URL = "";
+
+// ════════════════════════════════════════════════════════════
+// TWILIO SDK LOADER — loads from CDN dynamically
+// ════════════════════════════════════════════════════════════
+const loadTwilioSDK = () => new Promise((resolve, reject) => {
+  if (window.Twilio) { resolve(window.Twilio); return; }
+  const script = document.createElement("script");
+  script.src = "https://sdk.twilio.com/js/client/releases/1.14.0/twilio.min.js";
+  script.onload = () => resolve(window.Twilio);
+  script.onerror = () => reject(new Error("Twilio SDK failed to load"));
+  document.head.appendChild(script);
+});
+
+// ════════════════════════════════════════════════════════════
 // SECURITY LAYER — sanitize all user inputs, no XSS, no eval
 // ════════════════════════════════════════════════════════════
 const sanitize = (str) => String(str || "").replace(/[<>"'`]/g, "").trim().slice(0, 200);
