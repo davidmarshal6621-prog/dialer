@@ -227,18 +227,39 @@ router.get("/recordings/:sid/download", async (req, res) => {
   }
 });
 
-// 10. SIP VALIDATE
+// 10. SIP VALIDATE — actually tests provided credentials against Twilio API
 router.post("/sip/validate", async (req, res) => {
   const { domain, username, password, number } = req.body;
   if (!domain || !username || !password || !number) {
     return res.status(400).json({ valid: false, error: "All fields required" });
   }
-  if (!twilioClient) return res.json({ valid: false, error: "Twilio not configured on server" });
+  if (!domain.includes(".")) {
+    return res.status(400).json({ valid: false, error: "Invalid SIP domain format" });
+  }
+  if (!username.startsWith("AC") || username.length < 30) {
+    return res.status(400).json({ valid: false, error: "SIP Username must be your Twilio Account SID (starts with AC)" });
+  }
+  if (password.length < 16) {
+    return res.status(400).json({ valid: false, error: "SIP Password (Auth Token) appears too short" });
+  }
   try {
-    const numbers = await twilioClient.incomingPhoneNumbers.list({ phoneNumber: number });
-    if (numbers.length === 0) return res.json({ valid: false, error: "Number not in Twilio account" });
-    res.json({ valid: true, message: "SIP verified ✅" });
+    // Create a client with the provided credentials to actually test them
+    const testClient = twilio(username.trim(), password.trim());
+    // Try to fetch the account — this will fail with 401 if credentials are wrong
+    const account = await testClient.api.accounts(username.trim()).fetch();
+    if (!account || account.status === "suspended") {
+      return res.json({ valid: false, error: "Twilio account suspended or not found" });
+    }
+    // Verify the DID number belongs to this account
+    const numbers = await testClient.incomingPhoneNumbers.list({ phoneNumber: number });
+    if (numbers.length === 0) {
+      return res.json({ valid: false, error: `Number ${number} not found in this Twilio account` });
+    }
+    res.json({ valid: true, message: `SIP verified ✅ — Account: ${account.friendlyName}` });
   } catch (err) {
+    if (err.status === 401 || err.code === 20003) {
+      return res.json({ valid: false, error: "Invalid credentials — check your Account SID and Auth Token" });
+    }
     res.status(500).json({ valid: false, error: err.message });
   }
 });
@@ -261,8 +282,17 @@ app.use(`${BASE}/api`, router);
 
 // ── Start ────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n🚀 VoiceLink Pro running on port ${PORT}`);
   console.log(`   Local:   http://localhost:${PORT}${BASE}`);
   console.log(`   Health:  http://localhost:${PORT}${BASE}/api/health\n`);
+});
+
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`❌ Port ${PORT} already in use. Kill the other process and restart.`);
+    process.exit(1);
+  } else {
+    throw err;
+  }
 });
